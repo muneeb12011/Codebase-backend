@@ -2,17 +2,20 @@
 Codebase Visualizer — Backend API
 Vercel Python serverless function (Flask)
 """
+
 from flask import Flask, request, jsonify
 from api.auth import auth_bp
 import ast
 import json
 import os
 import re
+import sys
 import tempfile
 import shutil
 import zipfile
 import io
 from pathlib import Path
+from typing import Optional
 
 app = Flask(__name__)
 app.register_blueprint(auth_bp)
@@ -58,17 +61,8 @@ MAX_FILES = 300
 MAX_FILE_SIZE = 500_000
 MAX_REPO_MB = 150
 
-# ---------------------------------------------------------------------------
-# CORS helper
-# ---------------------------------------------------------------------------
-
-def cors_response(data=None, status=200):
-    resp = jsonify(data) if data is not None else jsonify({})
-    resp.status_code = status
-    resp.headers['Access-Control-Allow-Origin'] = '*'
-    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-    return resp
+# Vercel /tmp hard limit. Leave headroom for the process itself.
+MAX_TMP_BYTES = 400 * 1024 * 1024  # 400 MB
 
 # ---------------------------------------------------------------------------
 # GitHub helpers
@@ -96,22 +90,24 @@ def gh_request(url: str, timeout: int = 10) -> bytes:
 
 
 def check_repo_limits(owner_repo: str):
+    """Raises ValueError if repo exceeds size limit. Skips silently on API errors."""
     try:
         data = json.loads(gh_request(f"https://api.github.com/repos/{owner_repo}", timeout=8))
         size_kb = data.get('size', 0)
         size_mb = size_kb / 1024
         if size_mb > MAX_REPO_MB:
             raise ValueError(
-                f"Repository is {size_mb:.0f} MB — too large to analyze (limit: {MAX_REPO_MB} MB). "
-                f"Try a smaller repo or specify a branch with fewer files."
+                f"Repository is {size_mb:.0f} MB — too large to analyze "
+                f"(limit: {MAX_REPO_MB} MB). Try a smaller repo or a specific branch."
             )
     except ValueError:
         raise
     except Exception:
-        pass
+        pass  # GitHub API unavailable — let the zip attempt fail naturally
 
 
-def fetch_raw_file(owner_repo: str, branch: str, file_path: str) -> bytes:
+def fetch_raw_file(owner_repo: str, branch: str, file_path: str):
+    """Returns (content_bytes, used_branch). Tries branch, then main/master/HEAD."""
     branches_to_try = [branch] if branch else []
     branches_to_try += ['main', 'master', 'HEAD']
     for b in dict.fromkeys(branches_to_try):
@@ -124,6 +120,10 @@ def fetch_raw_file(owner_repo: str, branch: str, file_path: str) -> bytes:
 
 
 def fetch_repo_zip(owner_repo: str, branch: str = ''):
+    """
+    Downloads the repo zip. Timeout is capped at 25s to stay under Vercel's
+    60s function limit (leaving room for extraction + analysis).
+    """
     branches_to_try = [branch] if branch else []
     branches_to_try += ['main', 'master']
     for b in dict.fromkeys(branches_to_try):
@@ -132,18 +132,33 @@ def fetch_repo_zip(owner_repo: str, branch: str = ''):
         try:
             data = gh_request(
                 f"https://codeload.github.com/{owner_repo}/zip/refs/heads/{b}",
-                timeout=55
+                timeout=25,  # was 55 — would exceed Vercel's function limit
             )
             return data, b
         except Exception:
             continue
-    data = gh_request(f"https://codeload.github.com/{owner_repo}/zip/HEAD", timeout=55)
+    data = gh_request(
+        f"https://codeload.github.com/{owner_repo}/zip/HEAD",
+        timeout=25,
+    )
     return data, 'HEAD'
 
 
 def extract_zip(zip_bytes: bytes, tmpdir: str) -> str:
+    """
+    Extracts zip into tmpdir with a total-size guard to avoid filling /tmp.
+    Returns the path to the repo root inside tmpdir.
+    """
+    total_extracted = 0
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        zf.extractall(tmpdir)
+        for member in zf.infolist():
+            total_extracted += member.file_size
+            if total_extracted > MAX_TMP_BYTES:
+                raise ValueError(
+                    f"Extracted size exceeds {MAX_TMP_BYTES // (1024**2)} MB limit. "
+                    "Repository is too large to process."
+                )
+            zf.extract(member, tmpdir)
     dirs = [d for d in os.listdir(tmpdir) if os.path.isdir(os.path.join(tmpdir, d))]
     return os.path.join(tmpdir, dirs[0]) if dirs else tmpdir
 
@@ -151,7 +166,7 @@ def extract_zip(zip_bytes: bytes, tmpdir: str) -> str:
 # File reading
 # ---------------------------------------------------------------------------
 
-def read_file_safe(path: str) -> str | None:
+def read_file_safe(path: str) -> Optional[str]:  # Optional[str] works on Python 3.9
     try:
         raw = open(path, 'rb').read(MAX_FILE_SIZE)
         if HAS_CHARDET:
@@ -246,7 +261,7 @@ def extract_generic_info(content: str):
 # File analysis
 # ---------------------------------------------------------------------------
 
-def analyze_file(file_path: str, root_dir: str):
+def analyze_file(file_path: str, root_dir: str, keep_content: bool = False):
     ext = Path(file_path).suffix.lower()
     language = SUPPORTED_EXTENSIONS.get(ext)
     if not language:
@@ -273,7 +288,9 @@ def analyze_file(file_path: str, root_dir: str):
         'exports': info['exports'],
         'functions': info['functions'],
         'classes': info['classes'],
-        '_content': content,
+        # Only store raw content when a caller explicitly needs it (file detail endpoint).
+        # Keeping content for all 300 files wastes up to 150 MB of RAM.
+        '_content': content if keep_content else None,
     }
 
 # ---------------------------------------------------------------------------
@@ -307,9 +324,8 @@ def build_graph(files: list):
             else:
                 mod = imp.replace('.', '/').split('/')[0]
                 for fpath in file_index:
-                    stem = Path(fpath).stem
                     parts = fpath.split('/')
-                    if stem == mod or parts[0] == mod:
+                    if Path(fpath).stem == mod or parts[0] == mod:
                         if fpath != src:
                             edges.append({'source': src, 'target': fpath})
                             adj[src].append(fpath)
@@ -327,23 +343,36 @@ def build_graph(files: list):
         except Exception:
             pass
     else:
+        # Iterative DFS to avoid Python's default recursion limit (~1000)
+        # which is easily blown on a 300-node graph.
         visited: set = set()
-        rec_stack: set = set()
 
-        def dfs(node):
-            visited.add(node)
-            rec_stack.add(node)
-            for nb in adj.get(node, []):
-                if nb not in visited:
-                    dfs(nb)
-                elif nb in rec_stack:
-                    return [node, nb]
-            rec_stack.discard(node)
-            return None
+        def iterative_find_cycles(start: str):
+            """Yields (node, neighbour) pairs that form a back-edge."""
+            stack = [(start, iter(adj.get(start, [])))]
+            path = {start}
+            while stack:
+                node, children = stack[-1]
+                try:
+                    child = next(children)
+                    if child not in visited:
+                        if child in path:
+                            yield [node, child]  # back-edge → cycle
+                        else:
+                            path.add(child)
+                            stack.append((child, iter(adj.get(child, []))))
+                    elif child in path:
+                        yield [node, child]
+                except StopIteration:
+                    path.discard(node)
+                    visited.add(node)
+                    stack.pop()
 
         for n in list(adj.keys()):
             if n not in visited:
-                dfs(n)
+                for cycle_edge in iterative_find_cycles(n):
+                    if len(circular) < 20:
+                        circular.append(cycle_edge)
 
     return {'nodes': nodes, 'edges': edges, 'circularDependencies': circular}
 
@@ -356,16 +385,16 @@ def compute_summary(files: list, graph: dict, owner_repo: str):
 
     lang_counts: dict = {}
     for f in files:
-        l = f['language']
-        if l not in lang_counts:
-            lang_counts[l] = {'files': 0, 'lines': 0}
-        lang_counts[l]['files'] += 1
-        lang_counts[l]['lines'] += f['linesOfCode']
+        lang = f['language']
+        if lang not in lang_counts:
+            lang_counts[lang] = {'files': 0, 'lines': 0}
+        lang_counts[lang]['files'] += 1
+        lang_counts[lang]['lines'] += f['linesOfCode']
 
     languages = sorted([
-        {'language': l, 'files': v['files'], 'lines': v['lines'],
+        {'language': lang, 'files': v['files'], 'lines': v['lines'],
          'percentage': v['files'] / total_files * 100}
-        for l, v in lang_counts.items()
+        for lang, v in lang_counts.items()
     ], key=lambda x: -x['files'])
 
     circ_count = len(graph['circularDependencies'])
@@ -406,6 +435,13 @@ def analyze_repo(repo_url: str, branch: str = '', file_path: str = ''):
         zip_bytes, used_branch = fetch_repo_zip(owner_repo, branch)
         root = extract_zip(zip_bytes, tmpdir)
 
+        # Free the raw zip bytes immediately — no need to keep both in RAM.
+        del zip_bytes
+
+        # When fetching a specific file we still need content; otherwise skip it
+        # to keep peak RAM low (300 files × 500 KB = up to 150 MB saved).
+        need_content = bool(file_path)
+
         files_data = []
         file_count = 0
         for dirpath, dirnames, filenames in os.walk(root):
@@ -414,9 +450,12 @@ def analyze_repo(repo_url: str, branch: str = '', file_path: str = ''):
                 if file_count >= MAX_FILES:
                     break
                 fpath = os.path.join(dirpath, fname)
-                if os.path.getsize(fpath) > MAX_FILE_SIZE:
+                try:
+                    if os.path.getsize(fpath) > MAX_FILE_SIZE:
+                        continue
+                except OSError:
                     continue
-                info = analyze_file(fpath, root)
+                info = analyze_file(fpath, root, keep_content=need_content)
                 if info:
                     files_data.append(info)
                     file_count += 1
@@ -426,7 +465,7 @@ def analyze_repo(repo_url: str, branch: str = '', file_path: str = ''):
 
         if file_path:
             norm_path = file_path.replace('\\', '/')
-            circ_files = set()
+            circ_files: set = set()
             for chain in graph['circularDependencies']:
                 circ_files.update(chain)
 
@@ -461,7 +500,7 @@ def analyze_repo(repo_url: str, branch: str = '', file_path: str = ''):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 # ---------------------------------------------------------------------------
-# Routes
+# CORS
 # ---------------------------------------------------------------------------
 
 @app.before_request
@@ -481,6 +520,9 @@ def add_cors(resp):
     resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     return resp
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.route('/api/healthz', methods=['GET'])
 def healthz():
@@ -593,3 +635,7 @@ def route_summary():
         return jsonify(result.get('summary', result))
     except Exception as e:
         return jsonify({'error': str(e)}), 422
+    
+# Vercel entry point
+def handler(request):
+    return app
