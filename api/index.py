@@ -3,21 +3,18 @@ Codebase Visualizer — Backend API
 Vercel Python serverless function (Flask)
 """
 from flask import Flask, request, jsonify
+from api.auth import auth_bp
 import ast
 import json
 import os
 import re
-import math
 import tempfile
 import shutil
 import zipfile
 import io
-from api.auth import auth_bp   # 👈 ADD THIS LINE
 from pathlib import Path
-from typing import Any
 
 app = Flask(__name__)
-
 app.register_blueprint(auth_bp)
 
 try:
@@ -32,27 +29,7 @@ try:
 except ImportError:
     HAS_NX = False
 
-try:
-    from flask_limiter import Limiter
-    from flask_limiter.util import get_remote_address
-    HAS_LIMITER = True
-except ImportError:
-    HAS_LIMITER = False
-
 import urllib.request
-
-app = Flask(__name__)
-
-# Rate limiting (10 analyses/minute, 100/hour)
-if HAS_LIMITER:
-    limiter = Limiter(
-        get_remote_address,
-        app=app,
-        default_limits=["100 per hour", "10 per minute"],
-        storage_uri="memory://",
-    )
-else:
-    limiter = None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -77,10 +54,9 @@ SKIP_DIRS = {
     'fixtures', 'assets', 'static', 'public', 'migrations', '.yarn',
 }
 
-MAX_FILES = 300          # max files to walk per repo
-MAX_FILE_SIZE = 500_000  # 500 KB per file
-MAX_REPO_MB = 150        # reject repos larger than 150 MB (GitHub reports in KB)
-MAX_REPO_FILES = 10000   # reject repos with too many total files
+MAX_FILES = 300
+MAX_FILE_SIZE = 500_000
+MAX_REPO_MB = 150
 
 # ---------------------------------------------------------------------------
 # CORS helper
@@ -120,7 +96,6 @@ def gh_request(url: str, timeout: int = 10) -> bytes:
 
 
 def check_repo_limits(owner_repo: str):
-    """Reject repos that are too large before downloading. Uses GitHub public API."""
     try:
         data = json.loads(gh_request(f"https://api.github.com/repos/{owner_repo}", timeout=8))
         size_kb = data.get('size', 0)
@@ -133,14 +108,13 @@ def check_repo_limits(owner_repo: str):
     except ValueError:
         raise
     except Exception:
-        pass  # If GitHub API fails, proceed anyway
+        pass
 
 
 def fetch_raw_file(owner_repo: str, branch: str, file_path: str) -> bytes:
-    """Fetch a single file via GitHub raw content API — takes < 1s."""
     branches_to_try = [branch] if branch else []
     branches_to_try += ['main', 'master', 'HEAD']
-    for b in dict.fromkeys(branches_to_try):  # deduplicate preserving order
+    for b in dict.fromkeys(branches_to_try):
         try:
             url = f"https://raw.githubusercontent.com/{owner_repo}/{b}/{file_path}"
             return gh_request(url, timeout=10), b
@@ -152,7 +126,6 @@ def fetch_raw_file(owner_repo: str, branch: str, file_path: str) -> bytes:
 def fetch_repo_zip(owner_repo: str, branch: str = ''):
     branches_to_try = [branch] if branch else []
     branches_to_try += ['main', 'master']
-
     for b in dict.fromkeys(branches_to_try):
         if not b:
             continue
@@ -190,7 +163,7 @@ def read_file_safe(path: str) -> str | None:
         return None
 
 # ---------------------------------------------------------------------------
-# Language-specific import/export extraction
+# Language-specific extraction
 # ---------------------------------------------------------------------------
 
 def extract_python_info(content: str, file_path: str):
@@ -206,10 +179,6 @@ def extract_python_info(content: str, file_path: str):
                 if node.module:
                     imports.append(node.module.split('.')[0])
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                if not any(isinstance(p, (ast.FunctionDef, ast.AsyncFunctionDef))
-                           for p in ast.walk(tree) if p is not node and
-                           any(c is node for c in ast.walk(p) if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)))):
-                    pass
                 func_info = {
                     'name': node.name,
                     'line': node.lineno,
@@ -224,7 +193,8 @@ def extract_python_info(content: str, file_path: str):
                 complexity += func_info['complexity'] - 1
             elif isinstance(node, ast.ClassDef):
                 classes.append({'name': node.name, 'line': node.lineno, 'methods': [
-                    m.name for m in node.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    m.name for m in node.body
+                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
                 ]})
         for node in ast.walk(tree):
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
@@ -310,10 +280,10 @@ def analyze_file(file_path: str, root_dir: str):
 # Graph + cycles
 # ---------------------------------------------------------------------------
 
-def build_graph(files: list[dict]):
+def build_graph(files: list):
     file_index = {f['filePath'] for f in files}
     nodes, edges = [], []
-    adj: dict[str, list[str]] = {}
+    adj: dict = {}
     for f in files:
         nodes.append({'id': f['filePath'], 'language': f['language'],
                       'linesOfCode': f['linesOfCode'], 'complexity': f['complexity'],
@@ -324,7 +294,6 @@ def build_graph(files: list[dict]):
         src = f['filePath']
         src_dir = os.path.dirname(src)
         for imp in f['imports']:
-            # Resolve relative imports
             if imp.startswith('.'):
                 base = os.path.normpath(os.path.join(src_dir, imp)).replace('\\', '/')
                 candidates = [base, base + '.py', base + '.ts', base + '.tsx',
@@ -336,7 +305,6 @@ def build_graph(files: list[dict]):
                         adj[src].append(c)
                         break
             else:
-                # Try matching by module name
                 mod = imp.replace('.', '/').split('/')[0]
                 for fpath in file_index:
                     stem = Path(fpath).stem
@@ -347,7 +315,7 @@ def build_graph(files: list[dict]):
                             adj[src].append(fpath)
                             break
 
-    circular: list[list[str]] = []
+    circular: list = []
     if HAS_NX:
         G = nx.DiGraph()
         G.add_nodes_from(f['filePath'] for f in files)
@@ -359,18 +327,15 @@ def build_graph(files: list[dict]):
         except Exception:
             pass
     else:
-        # Simple DFS cycle detection fallback
-        visited: set[str] = set()
-        rec_stack: set[str] = set()
+        visited: set = set()
+        rec_stack: set = set()
 
         def dfs(node):
             visited.add(node)
             rec_stack.add(node)
             for nb in adj.get(node, []):
                 if nb not in visited:
-                    cycle = dfs(nb)
-                    if cycle:
-                        return cycle
+                    dfs(nb)
                 elif nb in rec_stack:
                     return [node, nb]
             rec_stack.discard(node)
@@ -383,13 +348,13 @@ def build_graph(files: list[dict]):
     return {'nodes': nodes, 'edges': edges, 'circularDependencies': circular}
 
 
-def compute_summary(files: list[dict], graph: dict, owner_repo: str):
+def compute_summary(files: list, graph: dict, owner_repo: str):
     total_files = len(files)
     total_lines = sum(f['linesOfCode'] for f in files)
     total_size = sum(f['size'] for f in files)
     avg_complexity = sum(f['complexity'] for f in files) / max(total_files, 1)
 
-    lang_counts: dict[str, dict] = {}
+    lang_counts: dict = {}
     for f in files:
         l = f['language']
         if l not in lang_counts:
@@ -434,7 +399,6 @@ def analyze_repo(repo_url: str, branch: str = '', file_path: str = ''):
     owner_repo, detected_branch = parse_github_url(repo_url)
     branch = branch or detected_branch
 
-    # Pre-flight: reject repos that are too large before we touch the zip
     check_repo_limits(owner_repo)
 
     tmpdir = tempfile.mkdtemp()
@@ -460,36 +424,31 @@ def analyze_repo(repo_url: str, branch: str = '', file_path: str = ''):
         graph = build_graph(files_data)
         summary = compute_summary(files_data, graph, owner_repo)
 
-        # Strip _content from graph nodes before returning
-        files_no_content = [{k: v for k, v in f.items() if k != '_content'} for f in files_data]
-
         if file_path:
             norm_path = file_path.replace('\\', '/')
-            found = None
             circ_files = set()
             for chain in graph['circularDependencies']:
                 circ_files.update(chain)
 
             for f in files_data:
                 if f['filePath'] == norm_path or f['filePath'].endswith(norm_path):
-                    found = {
-                        'filePath': f['filePath'],
-                        'language': f['language'],
-                        'linesOfCode': f['linesOfCode'],
-                        'size': f['size'],
-                        'complexity': f['complexity'],
-                        'imports': f['imports'],
-                        'exports': f['exports'],
-                        'functions': f['functions'],
-                        'classes': f['classes'],
-                        'isCircular': f['filePath'] in circ_files,
-                        'content': f['_content'] or '',
+                    return {
+                        'action': 'file_details',
+                        'result': {
+                            'filePath': f['filePath'],
+                            'language': f['language'],
+                            'linesOfCode': f['linesOfCode'],
+                            'size': f['size'],
+                            'complexity': f['complexity'],
+                            'imports': f['imports'],
+                            'exports': f['exports'],
+                            'functions': f['functions'],
+                            'classes': f['classes'],
+                            'isCircular': f['filePath'] in circ_files,
+                            'content': f['_content'] or '',
+                        }
                     }
-                    break
-
-            if not found:
-                return {'error': f'File not found: {file_path}'}
-            return {'action': 'file_details', 'result': found}
+            return {'error': f'File not found: {file_path}'}
 
         return {
             'action': 'analyze',
@@ -563,15 +522,10 @@ def route_graph():
 
 @app.route('/api/analysis/file', methods=['POST'])
 def route_file():
-    """
-    Fast file detail endpoint — fetches a single file via GitHub raw content API
-    (< 1 second) instead of re-downloading the entire repository zip.
-    """
     body = request.get_json(silent=True) or {}
     repo_url = body.get('repoUrl', '')
     branch = body.get('branch') or ''
     file_path = body.get('filePath', '')
-    # isCircular is determined by the frontend from cached graph data
     is_circular = bool(body.get('isCircular', False))
 
     if not repo_url or not file_path:
@@ -581,25 +535,20 @@ def route_file():
         owner_repo, detected_branch = parse_github_url(repo_url)
         branch = branch or detected_branch
 
-        # Fetch just this one file — takes < 1 second via GitHub raw API
         content_bytes, used_branch = fetch_raw_file(owner_repo, branch, file_path)
 
-        # Decode
         if HAS_CHARDET:
             enc = chardet.detect(content_bytes).get('encoding') or 'utf-8'
         else:
             enc = 'utf-8'
         content = content_bytes.decode(enc, errors='replace')
 
-        # Truncate very large files for display
         if len(content) > MAX_FILE_SIZE:
-            content = content[:MAX_FILE_SIZE] + '\n\n# [file truncated — too large to display fully]'
+            content = content[:MAX_FILE_SIZE] + '\n\n# [file truncated]'
 
-        # Determine language
         ext = ('.' + file_path.rsplit('.', 1)[-1].lower()) if '.' in file_path else ''
         language = SUPPORTED_EXTENSIONS.get(ext, 'Text')
 
-        # AST / regex analysis on just this file
         if language == 'Python':
             info = extract_python_info(content, file_path)
         elif language in ('JavaScript', 'TypeScript'):
