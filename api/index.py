@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 app = Flask(__name__)
-app.register_blueprint(auth_bp)
+app.register_blueprint(auth_bp, url_prefix='/api/auth')  # FIX: was missing url_prefix
 
 try:
     import chardet
@@ -120,10 +120,6 @@ def fetch_raw_file(owner_repo: str, branch: str, file_path: str):
 
 
 def fetch_repo_zip(owner_repo: str, branch: str = ''):
-    """
-    Downloads the repo zip. Timeout is capped at 25s to stay under Vercel's
-    60s function limit (leaving room for extraction + analysis).
-    """
     branches_to_try = [branch] if branch else []
     branches_to_try += ['main', 'master']
     for b in dict.fromkeys(branches_to_try):
@@ -132,7 +128,7 @@ def fetch_repo_zip(owner_repo: str, branch: str = ''):
         try:
             data = gh_request(
                 f"https://codeload.github.com/{owner_repo}/zip/refs/heads/{b}",
-                timeout=25,  # was 55 — would exceed Vercel's function limit
+                timeout=25,
             )
             return data, b
         except Exception:
@@ -145,10 +141,6 @@ def fetch_repo_zip(owner_repo: str, branch: str = ''):
 
 
 def extract_zip(zip_bytes: bytes, tmpdir: str) -> str:
-    """
-    Extracts zip into tmpdir with a total-size guard to avoid filling /tmp.
-    Returns the path to the repo root inside tmpdir.
-    """
     total_extracted = 0
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         for member in zf.infolist():
@@ -166,7 +158,7 @@ def extract_zip(zip_bytes: bytes, tmpdir: str) -> str:
 # File reading
 # ---------------------------------------------------------------------------
 
-def read_file_safe(path: str) -> Optional[str]:  # Optional[str] works on Python 3.9
+def read_file_safe(path: str) -> Optional[str]:
     try:
         raw = open(path, 'rb').read(MAX_FILE_SIZE)
         if HAS_CHARDET:
@@ -288,8 +280,6 @@ def analyze_file(file_path: str, root_dir: str, keep_content: bool = False):
         'exports': info['exports'],
         'functions': info['functions'],
         'classes': info['classes'],
-        # Only store raw content when a caller explicitly needs it (file detail endpoint).
-        # Keeping content for all 300 files wastes up to 150 MB of RAM.
         '_content': content if keep_content else None,
     }
 
@@ -343,12 +333,9 @@ def build_graph(files: list):
         except Exception:
             pass
     else:
-        # Iterative DFS to avoid Python's default recursion limit (~1000)
-        # which is easily blown on a 300-node graph.
         visited: set = set()
 
         def iterative_find_cycles(start: str):
-            """Yields (node, neighbour) pairs that form a back-edge."""
             stack = [(start, iter(adj.get(start, [])))]
             path = {start}
             while stack:
@@ -357,7 +344,7 @@ def build_graph(files: list):
                     child = next(children)
                     if child not in visited:
                         if child in path:
-                            yield [node, child]  # back-edge → cycle
+                            yield [node, child]
                         else:
                             path.add(child)
                             stack.append((child, iter(adj.get(child, []))))
@@ -435,11 +422,8 @@ def analyze_repo(repo_url: str, branch: str = '', file_path: str = ''):
         zip_bytes, used_branch = fetch_repo_zip(owner_repo, branch)
         root = extract_zip(zip_bytes, tmpdir)
 
-        # Free the raw zip bytes immediately — no need to keep both in RAM.
         del zip_bytes
 
-        # When fetching a specific file we still need content; otherwise skip it
-        # to keep peak RAM low (300 files × 500 KB = up to 150 MB saved).
         need_content = bool(file_path)
 
         files_data = []
@@ -500,24 +484,28 @@ def analyze_repo(repo_url: str, branch: str = '', file_path: str = ''):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 # ---------------------------------------------------------------------------
-# CORS
+# CORS — handle preflight + stamp every response
 # ---------------------------------------------------------------------------
 
 @app.before_request
 def handle_options():
     if request.method == 'OPTIONS':
         resp = app.make_default_options_response()
-        resp.headers['Access-Control-Allow-Origin'] = '*'
-        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        origin = request.headers.get('Origin', '*')
+        resp.headers['Access-Control-Allow-Origin']      = origin
+        resp.headers['Access-Control-Allow-Credentials'] = 'true'
+        resp.headers['Access-Control-Allow-Methods']     = 'GET, POST, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers']     = 'Content-Type, Authorization'
         return resp
 
 
 @app.after_request
 def add_cors(resp):
-    resp.headers['Access-Control-Allow-Origin'] = '*'
-    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    origin = request.headers.get('Origin', '*')
+    resp.headers['Access-Control-Allow-Origin']      = origin
+    resp.headers['Access-Control-Allow-Credentials'] = 'true'
+    resp.headers['Access-Control-Allow-Methods']     = 'GET, POST, OPTIONS'
+    resp.headers['Access-Control-Allow-Headers']     = 'Content-Type, Authorization'
     return resp
 
 # ---------------------------------------------------------------------------
@@ -635,7 +623,8 @@ def route_summary():
         return jsonify(result.get('summary', result))
     except Exception as e:
         return jsonify({'error': str(e)}), 422
-    
+
+
 # Vercel entry point
 def handler(request):
     return app
